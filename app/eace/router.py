@@ -2,7 +2,7 @@ import asyncio
 import os
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import Response
 from playwright.async_api import async_playwright
 
@@ -13,8 +13,15 @@ router = APIRouter(prefix="/report", tags=["report"])
 _lock = asyncio.Lock()
 
 
+def _check_api_key(x_api_key: str | None):
+    api_key = os.environ.get("API_KEY")
+    if api_key and x_api_key != api_key:
+        raise HTTPException(status_code=401, detail="API key inválida ou ausente")
+
+
 @router.post("/run-report")
-async def run_report_endpoint():
+async def run_report_endpoint(x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
     email = os.environ.get("EACE_EMAIL")
     password = os.environ.get("EACE_PASSWORD")
     if not email or not password:
