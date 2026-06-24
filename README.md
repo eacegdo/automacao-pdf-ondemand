@@ -124,3 +124,9 @@ Ou acessar `https://<seu-dominio>/docs` para o Swagger UI.
 - O robô usa Chromium headless — uma execução por vez (requisições simultâneas retornam `429`)
 - Credenciais nunca devem ser commitadas — usar variáveis de ambiente sempre
 - Se o site da EACE mudar o HTML, os seletores em `app/eace/scraper.py` precisam ser atualizados
+
+---
+
+## Desenvolvido por
+
+**Wellington Santos**
