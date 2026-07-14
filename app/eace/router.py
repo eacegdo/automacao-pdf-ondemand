@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -36,6 +37,8 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
 
     if _lock.locked():
         raise HTTPException(status_code=429, detail="Robô já em execução. Tente em instantes.")
+
+    start_time = time.monotonic()
 
     async with _lock:
         last_error: Exception | None = None
@@ -75,9 +78,15 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
         if pdf_bytes is None:
             raise HTTPException(status_code=502, detail=str(last_error))
 
+    elapsed = time.monotonic() - start_time
+    logger.info("Relatório gerado em %.1fs.", elapsed)
+
     filename = f"status_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "X-Generation-Time-Seconds": f"{elapsed:.1f}",
+        },
     )
