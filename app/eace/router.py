@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import datetime
 
@@ -7,6 +8,8 @@ from fastapi.responses import Response
 from playwright.async_api import async_playwright
 
 from app.eace.scraper import run_report
+
+logger = logging.getLogger("eace.router")
 
 router = APIRouter(prefix="/report", tags=["report"])
 
@@ -51,6 +54,7 @@ async def run_report_endpoint(x_api_key: str | None = Header(default=None)):
                 finally:
                     await browser.close()
         except Exception as e:
+            logger.exception("Falha na automação do Status Report")
             raise HTTPException(status_code=502, detail=str(e))
 
     filename = f"status_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"

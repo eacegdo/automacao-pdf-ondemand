@@ -1,7 +1,11 @@
+import logging
+
 from fastapi import FastAPI
 
 from app.eace.router import router as eace_router
 from app.weather.router import router as weather_router
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
 
 def create_app() -> FastAPI:
