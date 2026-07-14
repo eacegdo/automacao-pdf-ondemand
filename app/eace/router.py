@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime
 
@@ -12,6 +13,19 @@ from app.eace.scraper import EaceLoginError, EacePopupError, run_report
 logger = logging.getLogger("eace.router")
 
 router = APIRouter(prefix="/report", tags=["report"])
+
+BLOCKED_DOMAINS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.net",
+    "connect.facebook.net",
+    "hotjar.com",
+    "intercom.io",
+    "widget.intercom.io",
+    "segment.com",
+    "sentry.io",
+)
 
 _lock = asyncio.Lock()
 
@@ -54,6 +68,10 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/125.0.0.0 Safari/537.36"
                     ),
+                )
+                await context.route(
+                    re.compile("|".join(re.escape(d) for d in BLOCKED_DOMAINS)),
+                    lambda route: route.abort(),
                 )
                 try:
                     pdf_bytes = await run_report(context, email, password)

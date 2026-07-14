@@ -36,7 +36,7 @@ class EacePopupError(Exception):
 
 async def _login(page: Page, email: str, password: str) -> None:
     logger.info("Abrindo página de login...")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+    await page.goto(LOGIN_URL, wait_until="commit", timeout=30_000)
     email_input = page.locator("input[type='email']")
     await email_input.wait_for(state="visible", timeout=10_000)
     await email_input.fill(email)
@@ -53,7 +53,7 @@ async def _login(page: Page, email: str, password: str) -> None:
 
 async def _fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
     logger.info("Navegando até o Status Report...")
-    await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
+    await page.goto(REPORT_URL, wait_until="commit", timeout=30_000)
 
     # --- ABRE MENU LATERAL ---
     logger.info("Abrindo menu lateral...")
