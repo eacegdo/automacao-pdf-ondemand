@@ -1,44 +1,67 @@
 import asyncio
 import logging
 import os
-import re
 import time
 from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import Response
 
-from app.eace.scraper import EaceLoginError, EacePopupError, run_report
+from app.eace.scraper import (
+    EaceLoginError,
+    EacePopupError,
+    fetch_report_pdf,
+    login,
+    save_error_screenshot,
+)
 
 logger = logging.getLogger("eace.router")
 
 router = APIRouter(prefix="/report", tags=["report"])
 
-BLOCKED_DOMAINS = (
-    "google-analytics.com",
-    "googletagmanager.com",
-    "doubleclick.net",
-    "facebook.net",
-    "connect.facebook.net",
-    "hotjar.com",
-    "intercom.io",
-    "widget.intercom.io",
-    "segment.com",
-    "sentry.io",
-)
-
 _lock = asyncio.Lock()
 
-# Retry aqui é só pra falha de LOGIN (contexto novo, sem sessão pra perder).
-# Retry de report (sessão já logada) é tratado dentro de run_report, reusando a página.
 MAX_LOGIN_ATTEMPTS = 2
 LOGIN_RETRY_BACKOFF_SECONDS = 5
+
+MAX_REPORT_ATTEMPTS = 3
+REPORT_RETRY_BACKOFF_SECONDS = 3
 
 
 def _check_api_key(x_api_key: str | None):
     api_key = os.environ.get("API_KEY")
     if api_key and x_api_key != api_key:
         raise HTTPException(status_code=401, detail="API key inválida ou ausente")
+
+
+async def _ensure_logged_in(request: Request, email: str, password: str) -> None:
+    if request.app.state.logged_in:
+        return
+
+    context = request.app.state.context
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
+        page = await context.new_page()
+        try:
+            await login(page, email, password)
+            request.app.state.logged_in = True
+            await page.close()
+            return
+        except EaceLoginError as e:
+            last_error = e
+            await page.close()
+            logger.warning(
+                "Tentativa de login %d/%d falhou (%s). %s",
+                attempt, MAX_LOGIN_ATTEMPTS, e,
+                "Tentando novamente..." if attempt < MAX_LOGIN_ATTEMPTS else "Desistindo.",
+            )
+            if attempt < MAX_LOGIN_ATTEMPTS:
+                await asyncio.sleep(LOGIN_RETRY_BACKOFF_SECONDS)
+        except Exception as e:
+            await page.close()
+            raise HTTPException(status_code=502, detail=str(e))
+
+    raise HTTPException(status_code=502, detail=str(last_error))
 
 
 @router.post("/run-report")
@@ -55,42 +78,45 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
     start_time = time.monotonic()
 
     async with _lock:
+        context = request.app.state.context
+        await _ensure_logged_in(request, email, password)
+
         last_error: Exception | None = None
         pdf_bytes: bytes | None = None
-        for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
+        session_relogged = False
+
+        for attempt in range(1, MAX_REPORT_ATTEMPTS + 1):
+            page = await context.new_page()
             try:
-                browser = request.app.state.browser
-                context = await browser.new_context(
-                    locale="pt-BR",
-                    viewport={"width": 1280, "height": 900},
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                )
-                await context.route(
-                    re.compile("|".join(re.escape(d) for d in BLOCKED_DOMAINS)),
-                    lambda route: route.abort(),
-                )
-                try:
-                    pdf_bytes = await run_report(context, email, password)
-                finally:
-                    await context.close()
+                pdf_bytes = await fetch_report_pdf(context, page)
+                await page.close()
                 break
             except EaceLoginError as e:
+                await page.close()
+                last_error = e
+                if session_relogged:
+                    # Já tentou relogar uma vez e sessão caiu de novo — para de insistir.
+                    raise HTTPException(status_code=502, detail=str(e))
+                logger.warning("Sessão expirou em pleno uso (%s). Relogando...", e)
+                request.app.state.logged_in = False
+                session_relogged = True
+                await _ensure_logged_in(request, email, password)
+            except EacePopupError as e:
                 last_error = e
                 logger.warning(
-                    "Tentativa de login %d/%d falhou (%s). %s",
-                    attempt, MAX_LOGIN_ATTEMPTS, e,
-                    "Tentando novamente..." if attempt < MAX_LOGIN_ATTEMPTS else "Desistindo.",
+                    "Tentativa %d/%d de buscar o report falhou (%s). %s",
+                    attempt, MAX_REPORT_ATTEMPTS, e,
+                    "Tentando novamente..." if attempt < MAX_REPORT_ATTEMPTS else "Desistindo.",
                 )
-                if attempt < MAX_LOGIN_ATTEMPTS:
-                    await asyncio.sleep(LOGIN_RETRY_BACKOFF_SECONDS)
-            except EacePopupError as e:
-                raise HTTPException(status_code=502, detail=str(e))
+                if attempt < MAX_REPORT_ATTEMPTS:
+                    await page.close()
+                    await asyncio.sleep(REPORT_RETRY_BACKOFF_SECONDS)
+                else:
+                    await save_error_screenshot(page, "report")
+                    await page.close()
             except Exception as e:
                 logger.exception("Falha na automação do Status Report")
+                await page.close()
                 raise HTTPException(status_code=502, detail=str(e))
 
         if pdf_bytes is None:
