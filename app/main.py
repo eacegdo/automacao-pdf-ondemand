@@ -40,6 +40,8 @@ async def lifespan(app: FastAPI):
     app.state.browser = browser
     app.state.context = context
     app.state.logged_in = False
+    app.state.report_page = None
+    app.state.report_ready = False
     logger.info("Chromium pronto.")
 
     email = os.environ.get("EACE_EMAIL")
@@ -48,11 +50,15 @@ async def lifespan(app: FastAPI):
         try:
             page = await context.new_page()
             await scraper.login(page, email, password)
-            await page.close()
             app.state.logged_in = True
-            logger.info("Sessão já iniciada no startup — logins subsequentes serão pulados.")
+            await scraper.open_report_page(page)
+            app.state.report_page = page
+            app.state.report_ready = True
+            logger.info("Status Report já aberto — requests só vão extrair o PDF da tela.")
         except Exception:
-            logger.exception("Login no startup falhou — será tentado de novo na primeira requisição.")
+            logger.exception(
+                "Login/abertura do report no startup falhou — será tentado na primeira requisição."
+            )
 
     yield
     await context.close()
