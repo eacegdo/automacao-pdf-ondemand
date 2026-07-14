@@ -14,8 +14,10 @@ router = APIRouter(prefix="/report", tags=["report"])
 
 _lock = asyncio.Lock()
 
-MAX_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = 5
+# Retry aqui é só pra falha de LOGIN (contexto novo, sem sessão pra perder).
+# Retry de report (sessão já logada) é tratado dentro de run_report, reusando a página.
+MAX_LOGIN_ATTEMPTS = 2
+LOGIN_RETRY_BACKOFF_SECONDS = 5
 
 
 def _check_api_key(x_api_key: str | None):
@@ -38,7 +40,7 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
     async with _lock:
         last_error: Exception | None = None
         pdf_bytes: bytes | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
             try:
                 browser = request.app.state.browser
                 context = await browser.new_context(
@@ -55,15 +57,17 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
                 finally:
                     await context.close()
                 break
-            except (EaceLoginError, EacePopupError) as e:
+            except EaceLoginError as e:
                 last_error = e
                 logger.warning(
-                    "Tentativa %d/%d falhou (%s). %s",
-                    attempt, MAX_ATTEMPTS, e,
-                    "Tentando novamente..." if attempt < MAX_ATTEMPTS else "Desistindo.",
+                    "Tentativa de login %d/%d falhou (%s). %s",
+                    attempt, MAX_LOGIN_ATTEMPTS, e,
+                    "Tentando novamente..." if attempt < MAX_LOGIN_ATTEMPTS else "Desistindo.",
                 )
-                if attempt < MAX_ATTEMPTS:
-                    await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+                if attempt < MAX_LOGIN_ATTEMPTS:
+                    await asyncio.sleep(LOGIN_RETRY_BACKOFF_SECONDS)
+            except EacePopupError as e:
+                raise HTTPException(status_code=502, detail=str(e))
             except Exception as e:
                 logger.exception("Falha na automação do Status Report")
                 raise HTTPException(status_code=502, detail=str(e))
