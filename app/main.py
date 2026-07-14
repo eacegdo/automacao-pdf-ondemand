@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ from fastapi import FastAPI
 from playwright.async_api import async_playwright
 
 from app.eace import scraper
+from app.eace.router import _lock as report_lock
 from app.eace.router import router as eace_router
 from app.weather.router import router as weather_router
 
@@ -15,6 +17,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)
 logger = logging.getLogger("app")
 
 _BLOCKED_DOMAINS_RE = re.compile("|".join(re.escape(d) for d in scraper.BLOCKED_DOMAINS))
+
+SESSION_CHECK_INTERVAL_SECONDS = 3600
+
+
+async def _session_watchdog(app: FastAPI) -> None:
+    email = os.environ.get("EACE_EMAIL")
+    password = os.environ.get("EACE_PASSWORD")
+    if not (email and password):
+        return
+
+    while True:
+        await asyncio.sleep(SESSION_CHECK_INTERVAL_SECONDS)
+        async with report_lock:
+            try:
+                if await scraper.verify_session(app.state.context):
+                    logger.info("Checagem periódica: sessão ainda válida.")
+                    app.state.logged_in = True
+                    continue
+
+                logger.info("Checagem periódica: sessão caiu. Relogando...")
+                page = await app.state.context.new_page()
+                try:
+                    await scraper.login(page, email, password)
+                    app.state.logged_in = True
+                    logger.info("Sessão renovada pela checagem periódica.")
+                finally:
+                    await page.close()
+            except Exception:
+                logger.exception("Checagem periódica de sessão falhou.")
+                app.state.logged_in = False
 
 
 @asynccontextmanager
@@ -40,8 +72,6 @@ async def lifespan(app: FastAPI):
     app.state.browser = browser
     app.state.context = context
     app.state.logged_in = False
-    app.state.report_page = None
-    app.state.report_ready = False
     logger.info("Chromium pronto.")
 
     email = os.environ.get("EACE_EMAIL")
@@ -50,17 +80,18 @@ async def lifespan(app: FastAPI):
         try:
             page = await context.new_page()
             await scraper.login(page, email, password)
+            await page.close()
             app.state.logged_in = True
-            await scraper.open_report_page(page)
-            app.state.report_page = page
-            app.state.report_ready = True
-            logger.info("Status Report já aberto — requests só vão extrair o PDF da tela.")
+            logger.info("Sessão já iniciada no startup — logins subsequentes serão pulados.")
         except Exception:
-            logger.exception(
-                "Login/abertura do report no startup falhou — será tentado na primeira requisição."
-            )
+            logger.exception("Login no startup falhou — será tentado de novo na primeira requisição.")
+
+    watchdog_task = asyncio.create_task(_session_watchdog(app))
 
     yield
+
+    watchdog_task.cancel()
+    await asyncio.gather(watchdog_task, return_exceptions=True)
     await context.close()
     await browser.close()
     await playwright.stop()

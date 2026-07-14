@@ -66,11 +66,20 @@ async def login(page: Page, email: str, password: str) -> None:
         raise
 
 
-async def open_report_page(page: Page) -> None:
-    """Navega até o Status Report e deixa o iframe aberto/carregado na página.
+async def verify_session(context: BrowserContext) -> bool:
+    """Checa, sem gerar PDF, se a sessão ainda está logada. Usado pelo watchdog periódico."""
+    page = await context.new_page()
+    try:
+        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
+        return "/login" not in page.url
+    finally:
+        await page.close()
 
-    Chamado só no startup e quando a sessão precisa ser reaberta — não a cada request,
-    já que o conteúdo do relatório atualiza em tempo real na própria tela do Bubble.
+
+async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
+    """Navega até o Status Report (sessão já logada) e gera o PDF.
+
+    Página é criada e fechada por request — não fica aba viva em repouso.
     """
     try:
         logger.info("Navegando até o Status Report...")
@@ -112,33 +121,10 @@ async def open_report_page(page: Page) -> None:
             await report_frame.wait_for_selector("button.btn-print", timeout=20_000)
         except Exception:
             raise EacePopupError("Conteúdo do Status Report não carregou no iframe.")
-        logger.info("Status Report aberto e pronto — página fica assim entre requests.")
-    except (EaceLoginError, EacePopupError):
-        raise
-    except Exception:
-        logger.exception("Erro inesperado ao abrir o report")
-        await save_error_screenshot(page, "abrir_report")
-        raise
+        logger.info("Conteúdo do relatório carregado.")
 
-
-async def render_report_pdf(context: BrowserContext, page: Page) -> bytes:
-    """Gera o PDF a partir do que já está aberto na tela (sem navegar/clicar de novo).
-
-    Levanta EaceLoginError/EacePopupError se a página caiu do estado esperado
-    (deslogou ou o iframe do report sumiu) — quem chama decide se reabre.
-    """
-    try:
-        if "/login" in page.url:
-            raise EaceLoginError("Sessão expirou — página caiu para tela de login.")
-
-        if len(page.frames) < 2:
-            raise EacePopupError("Iframe do Status Report não está mais aberto.")
-
-        report_frame = page.frames[1]
-        try:
-            await report_frame.wait_for_selector("button.btn-print", timeout=5_000)
-        except Exception:
-            raise EacePopupError("Conteúdo do Status Report não está disponível na página aberta.")
+        # Margem extra para gráficos/imagens renderizarem
+        await page.wait_for_timeout(1_000)
 
         # --- EXTRAI HTML DO IFRAME E GERA PDF EM PÁGINA LIMPA ---
         # page.pdf() captura overlay Bubble.io — precisa do iframe isolado
