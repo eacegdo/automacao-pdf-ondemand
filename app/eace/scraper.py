@@ -36,7 +36,7 @@ class EacePopupError(Exception):
 
 async def _login(page: Page, email: str, password: str) -> None:
     logger.info("Abrindo página de login...")
-    await page.goto(LOGIN_URL, wait_until="commit", timeout=30_000)
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
     email_input = page.locator("input[type='email']")
     await email_input.wait_for(state="visible", timeout=10_000)
     await email_input.fill(email)
@@ -53,19 +53,25 @@ async def _login(page: Page, email: str, password: str) -> None:
 
 async def _fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
     logger.info("Navegando até o Status Report...")
-    await page.goto(REPORT_URL, wait_until="commit", timeout=30_000)
+    await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
 
     # --- ABRE MENU LATERAL ---
     logger.info("Abrindo menu lateral...")
     hamburger = page.locator("div.clickable-element").first
-    await hamburger.wait_for(state="visible", timeout=10_000)
-    await hamburger.click(force=True)
+    try:
+        await hamburger.wait_for(state="visible", timeout=10_000)
+        await hamburger.click(force=True)
+    except Exception:
+        raise EacePopupError("Menu lateral não apareceu/não foi possível clicar.")
 
     # --- CLICA "Status report" ---
     logger.info("Clicando em 'Status report'...")
     sr = page.get_by_text("Status report").first
-    await sr.wait_for(state="visible", timeout=8_000)
-    await sr.click()
+    try:
+        await sr.wait_for(state="visible", timeout=8_000)
+        await sr.click()
+    except Exception:
+        raise EacePopupError("Opção 'Status report' não apareceu/não foi possível clicar.")
 
     # --- AGUARDA IFRAME ---
     logger.info("Aguardando iframe do relatório...")
