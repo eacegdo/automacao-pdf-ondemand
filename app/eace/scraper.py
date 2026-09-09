@@ -35,6 +35,12 @@ _report_frame_url: str | None = None
 # imprimimos assim mesmo — melhor um PDF com uma imagem faltando do que um timeout.
 SETTLE_TIMEOUT_MS = 5_000
 
+# Quanto tempo total damos pro report carregar, esperando na mesma tela.
+# Fatiado só pra poder logar progresso e cutucar o menu entre as fatias —
+# não recarregamos nada entre uma fatia e outra.
+IFRAME_BUDGET_SECONDS = 90
+IFRAME_SLICE_SECONDS = 20
+
 
 @asynccontextmanager
 async def _step(name: str):
@@ -134,6 +140,65 @@ async def _pdf_direto(context: BrowserContext, url: str) -> bytes | None:
         await pdf_page.close()
 
 
+async def _cutucar_status_report(page: Page) -> None:
+    """Se o item de menu ainda está na tela, o click anterior não pegou. Re-clica.
+
+    Best-effort: se o menu já sumiu (caso normal), não faz nada e não reclama.
+    """
+    try:
+        sr = page.get_by_text("Status report").first
+        if await sr.is_visible():
+            await sr.click()
+            logger.info("Menu ainda aberto — re-cliquei em 'Status report'.")
+    except Exception:
+        pass
+
+
+async def _esperar_report_frame(page: Page) -> Frame:
+    """Espera o report carregar sem sair da tela.
+
+    Duas mudanças em relação à versão que dava timeout em 15s:
+
+    1. Não exigimos state='visible' no iframe. Iframe do Bubble fica com altura 0
+       até o conteúdo chegar, então 'visible' podia nunca virar true mesmo com o
+       report carregando normalmente. O que importa é o btn-print lá dentro.
+    2. Se estourar uma fatia, seguimos esperando na MESMA página em vez de
+       recarregar a home (que custava ~15s de goto + menu a cada retry).
+    """
+    deadline = time.monotonic() + IFRAME_BUDGET_SECONDS
+    tentativa = 0
+    ultimo_erro = "iframe nunca ficou pronto"
+
+    while time.monotonic() < deadline:
+        tentativa += 1
+        restante = deadline - time.monotonic()
+        fatia_ms = int(min(IFRAME_SLICE_SECONDS, restante) * 1000)
+        if fatia_ms <= 0:
+            break
+        try:
+            handle = await page.wait_for_selector("iframe", state="attached", timeout=fatia_ms)
+            frame = await handle.content_frame()
+            if frame is None:
+                ultimo_erro = "iframe presente mas sem content_frame"
+            else:
+                await frame.wait_for_selector("button.btn-print", timeout=fatia_ms)
+                logger.info("Report pronto na tentativa %d.", tentativa)
+                return frame
+        except Exception as e:
+            ultimo_erro = str(e).splitlines()[0]
+
+        logger.info(
+            "Report ainda não pronto (%s). Continuando a esperar na mesma tela — "
+            "%.0fs de orçamento restante.",
+            ultimo_erro, max(0.0, deadline - time.monotonic()),
+        )
+        await _cutucar_status_report(page)
+
+    raise EacePopupError(
+        f"Report não carregou em {IFRAME_BUDGET_SECONDS}s ({ultimo_erro})."
+    )
+
+
 async def _abrir_report_frame(page: Page) -> Frame:
     """Caminho longo: home -> menu lateral -> Status report -> iframe carregado."""
     async with _step("goto home"):
@@ -158,20 +223,8 @@ async def _abrir_report_frame(page: Page) -> Frame:
         except Exception:
             raise EacePopupError("Opção 'Status report' não apareceu/não foi possível clicar.")
 
-    async with _step("iframe visível"):
-        try:
-            await page.locator("iframe").first.wait_for(state="visible", timeout=15_000)
-        except Exception:
-            raise EacePopupError("Iframe do Status Report não apareceu.")
-
-    report_frame = page.frames[1]
-    async with _step("conteúdo do iframe"):
-        try:
-            await report_frame.wait_for_selector("button.btn-print", timeout=20_000)
-        except Exception:
-            raise EacePopupError("Conteúdo do Status Report não carregou no iframe.")
-
-    return report_frame
+    async with _step("iframe + conteúdo"):
+        return await _esperar_report_frame(page)
 
 
 async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:

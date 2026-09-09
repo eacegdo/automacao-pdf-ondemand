@@ -20,7 +20,9 @@ _lock = asyncio.Lock()
 MAX_LOGIN_ATTEMPTS = 2
 LOGIN_RETRY_BACKOFF_SECONDS = 5
 
-MAX_REPORT_ATTEMPTS = 3
+# 2, não 3: o scraper agora espera até 90s na mesma tela antes de desistir, então
+# cada tentativa custa ~105s. Três estouraria o timeout de 300s do cliente.
+MAX_REPORT_ATTEMPTS = 2
 REPORT_RETRY_BACKOFF_SECONDS = 3
 
 
