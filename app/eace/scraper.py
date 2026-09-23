@@ -111,32 +111,32 @@ async def verify_session(context: BrowserContext) -> bool:
         await page.close()
 
 
-def _totais_carregados(text: str) -> bool:
-    match = re.search(r"TOTAL DE ESCOLAS CONECTADAS\s+(\d+)", text)
-    return bool(match and int(match.group(1)) > 0)
+def _numero(text: str, pattern: str) -> int:
+    match = re.search(pattern, text)
+    return int(match.group(1)) if match else 0
+
+
+def _dados_na_tela(text: str) -> bool:
+    """Totais históricos e pelo menos um indicador do dia, da semana ou do mês."""
+    if _numero(text, r"TOTAL DE ESCOLAS CONECTADAS\s+(\d+)") <= 0:
+        return False
+    return any(
+        _numero(text, pattern) > 0
+        for pattern in (
+            r"ESCOLAS CONECTADAS NA DATA\s+\+?\s*(\d+)",
+            r"Total da semana:\s*(\d+)",
+            r"REALIZADO DO MÊS\s+(\d+)",
+        )
+    )
 
 
 async def _esperar_dados(page: Page) -> None:
-    """O Bubble pinta o layout com zeros e preenche em duas levas.
-
-    Primeiro os totais históricos, depois o dia/semana e o gráfico. Imprimir
-    no meio gera PDF com +0. Espera o texto parar de mudar depois que o total
-    histórico já entrou.
-    """
-    deadline = time.monotonic() + 25
-    anterior = None
-    estavel = 0
-    while time.monotonic() < deadline:
-        texto = await page.inner_text("body")
-        if _totais_carregados(texto) and texto == anterior:
-            estavel += 1
-            if estavel >= 3:
-                return
-        else:
-            estavel = 0
-            anterior = texto
-        await page.wait_for_timeout(500)
-    raise EacePopupError("Números do Status Report não estabilizaram a tempo.")
+    """Abre, espera 5s e só segue se os números já estiverem na tela."""
+    logger.info("Aguardando 5s para os dados aparecerem na tela...")
+    await page.wait_for_timeout(5_000)
+    texto = await page.inner_text("body")
+    if READY_TEXT not in texto or not _dados_na_tela(texto):
+        raise EacePopupError("Dados do Status Report não apareceram em 5s.")
 
 
 async def _esconder_botao_imprimir(page: Page) -> None:
@@ -162,13 +162,7 @@ async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
             await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
             if "/login" in page.url:
                 raise EaceLoginError("Sessão expirou — redirecionado para tela de login.")
-            try:
-                await page.get_by_text(READY_TEXT).first.wait_for(state="visible", timeout=20_000)
-                await _esperar_dados(page)
-            except EacePopupError:
-                raise
-            except Exception:
-                raise EacePopupError("Status Report não apareceu em /status_report.")
+            await _esperar_dados(page)
 
         async with _step("gerar PDF"):
             await _settle(page)
