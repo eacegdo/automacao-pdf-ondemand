@@ -5,10 +5,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from playwright.async_api import BrowserContext, Frame, Page
+from playwright.async_api import BrowserContext, Page
 
-LOGIN_URL  = "https://eace.org.br/version-live/login"
-REPORT_URL = "https://eace.org.br/version-live/np_report_new"
+LOGIN_URL = "https://eace.org.br/version-live/login"
+REPORT_URL = "https://eace.org.br/status_report"
 
 OUTPUT_DIR = "output"
 
@@ -27,19 +27,12 @@ BLOCKED_DOMAINS = (
 
 logger = logging.getLogger("eace.scraper")
 
-# URL do iframe do Status Report, descoberta na primeira execução. Depois disso
-# vamos direto nela e pulamos o boot do app Bubble + menu lateral.
-_report_frame_url: str | None = None
+# Texto que só existe quando o dashboard terminou de renderizar.
+READY_TEXT = "Dashboard de Escolas Conectadas"
 
 # Quanto esperamos imagens/fontes terminarem antes de imprimir. Se estourar,
 # imprimimos assim mesmo — melhor um PDF com uma imagem faltando do que um timeout.
 SETTLE_TIMEOUT_MS = 5_000
-
-# Quanto tempo total damos pro report carregar, esperando na mesma tela.
-# Fatiado só pra poder logar progresso e cutucar o menu entre as fatias —
-# não recarregamos nada entre uma fatia e outra.
-IFRAME_BUDGET_SECONDS = 90
-IFRAME_SLICE_SECONDS = 20
 
 
 @asynccontextmanager
@@ -113,165 +106,85 @@ async def verify_session(context: BrowserContext) -> bool:
     page = await context.new_page()
     try:
         await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
-        return "/login" not in page.url
+        return "/login" not in page.url and "status_report" in page.url
     finally:
         await page.close()
 
 
-async def _pdf_direto(context: BrowserContext, url: str) -> bytes | None:
-    """Abre a URL do iframe direto e imprime. Pula o boot do Bubble e o menu.
+def _totais_carregados(text: str) -> bool:
+    match = re.search(r"TOTAL DE ESCOLAS CONECTADAS\s+(\d+)", text)
+    return bool(match and int(match.group(1)) > 0)
 
-    Devolve None se a página não for o report esperado — aí o chamador cai no
-    caminho longo. Nunca levanta EacePopupError: falhar aqui não é erro, é fallback.
+
+async def _esperar_dados(page: Page) -> None:
+    """O Bubble pinta o layout com zeros e preenche em duas levas.
+
+    Primeiro os totais históricos, depois o dia/semana e o gráfico. Imprimir
+    no meio gera PDF com +0. Espera o texto parar de mudar depois que o total
+    histórico já entrou.
     """
-    pdf_page = await context.new_page()
-    try:
-        await pdf_page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        if "/login" in pdf_page.url:
-            raise EaceLoginError("Sessão expirou — redirecionado para tela de login.")
-        try:
-            await pdf_page.wait_for_selector("button.btn-print", timeout=15_000)
-        except Exception:
-            logger.info("URL direta não renderizou o report; caindo no caminho longo.")
-            return None
-        await _settle(pdf_page)
-        return await pdf_page.pdf(format="A4", print_background=True)
-    finally:
-        await pdf_page.close()
-
-
-async def _cutucar_status_report(page: Page) -> None:
-    """Se o item de menu ainda está na tela, o click anterior não pegou. Re-clica.
-
-    Best-effort: se o menu já sumiu (caso normal), não faz nada e não reclama.
-    """
-    try:
-        sr = page.get_by_text("Status report").first
-        if await sr.is_visible():
-            await sr.click()
-            logger.info("Menu ainda aberto — re-cliquei em 'Status report'.")
-    except Exception:
-        pass
-
-
-async def _esperar_report_frame(page: Page) -> Frame:
-    """Espera o report carregar sem sair da tela.
-
-    Duas mudanças em relação à versão que dava timeout em 15s:
-
-    1. Não exigimos state='visible' no iframe. Iframe do Bubble fica com altura 0
-       até o conteúdo chegar, então 'visible' podia nunca virar true mesmo com o
-       report carregando normalmente. O que importa é o btn-print lá dentro.
-    2. Se estourar uma fatia, seguimos esperando na MESMA página em vez de
-       recarregar a home (que custava ~15s de goto + menu a cada retry).
-    """
-    deadline = time.monotonic() + IFRAME_BUDGET_SECONDS
-    tentativa = 0
-    ultimo_erro = "iframe nunca ficou pronto"
-
+    deadline = time.monotonic() + 25
+    anterior = None
+    estavel = 0
     while time.monotonic() < deadline:
-        tentativa += 1
-        restante = deadline - time.monotonic()
-        fatia_ms = int(min(IFRAME_SLICE_SECONDS, restante) * 1000)
-        if fatia_ms <= 0:
-            break
-        try:
-            handle = await page.wait_for_selector("iframe", state="attached", timeout=fatia_ms)
-            frame = await handle.content_frame()
-            if frame is None:
-                ultimo_erro = "iframe presente mas sem content_frame"
-            else:
-                await frame.wait_for_selector("button.btn-print", timeout=fatia_ms)
-                logger.info("Report pronto na tentativa %d.", tentativa)
-                return frame
-        except Exception as e:
-            ultimo_erro = str(e).splitlines()[0]
+        texto = await page.inner_text("body")
+        if _totais_carregados(texto) and texto == anterior:
+            estavel += 1
+            if estavel >= 3:
+                return
+        else:
+            estavel = 0
+            anterior = texto
+        await page.wait_for_timeout(500)
+    raise EacePopupError("Números do Status Report não estabilizaram a tempo.")
 
-        logger.info(
-            "Report ainda não pronto (%s). Continuando a esperar na mesma tela — "
-            "%.0fs de orçamento restante.",
-            ultimo_erro, max(0.0, deadline - time.monotonic()),
-        )
-        await _cutucar_status_report(page)
 
-    raise EacePopupError(
-        f"Report não carregou em {IFRAME_BUDGET_SECONDS}s ({ultimo_erro})."
+async def _esconder_botao_imprimir(page: Page) -> None:
+    """O botão é da tela, não do relatório. Some só no PDF."""
+    await page.evaluate(
+        """() => {
+          for (const el of document.querySelectorAll("button, a, div, span")) {
+            if (el.childElementCount > 3) continue;
+            const t = (el.innerText || "").replace(/\\s+/g, " ").trim();
+            if (t === "Imprimir / PDF") el.style.display = "none";
+          }
+        }"""
     )
 
 
-async def _abrir_report_frame(page: Page) -> Frame:
-    """Caminho longo: home -> menu lateral -> Status report -> iframe carregado."""
-    async with _step("goto home"):
-        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
-
-    if "/login" in page.url:
-        raise EaceLoginError("Sessão expirou — redirecionado para tela de login.")
-
-    async with _step("menu lateral"):
-        hamburger = page.locator("div.clickable-element").first
-        try:
-            await hamburger.wait_for(state="visible", timeout=10_000)
-            await hamburger.click(force=True)
-        except Exception:
-            raise EacePopupError("Menu lateral não apareceu/não foi possível clicar.")
-
-    async with _step("click Status report"):
-        sr = page.get_by_text("Status report").first
-        try:
-            await sr.wait_for(state="visible", timeout=8_000)
-            await sr.click()
-        except Exception:
-            raise EacePopupError("Opção 'Status report' não apareceu/não foi possível clicar.")
-
-    async with _step("iframe + conteúdo"):
-        return await _esperar_report_frame(page)
-
-
 async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
-    """Navega até o Status Report (sessão já logada) e gera o PDF.
+    """Abre https://eace.org.br/status_report (sessão já logada) e gera o PDF.
 
-    Página é criada e fechada por request — não fica aba viva em repouso.
+    A página do Bubble já é o dashboard. Não tem menu lateral nem iframe.
     """
-    global _report_frame_url
-
     try:
-        if _report_frame_url:
-            async with _step("caminho rápido (URL direta)"):
-                pdf_bytes = await _pdf_direto(context, _report_frame_url)
-            if pdf_bytes is not None:
-                logger.info("PDF gerado pelo caminho rápido (%d bytes).", len(pdf_bytes))
-                return pdf_bytes
-            _report_frame_url = None
-
-        report_frame = await _abrir_report_frame(page)
-
-        # Guarda pra próxima chamada ir direto.
-        if report_frame.url and report_frame.url != "about:blank":
-            _report_frame_url = report_frame.url
-            logger.info("URL do report cacheada: %s", _report_frame_url)
-
-        # --- EXTRAI HTML DO IFRAME E GERA PDF EM PÁGINA LIMPA ---
-        # page.pdf() captura overlay Bubble.io — precisa do iframe isolado
-        async with _step("extrair HTML + gerar PDF"):
-            report_html = await report_frame.content()
-
-            # Sem <base>, todo caminho relativo do report resolve contra about:blank
-            # e o recurso morre — o que fazia o antigo networkidle esperar à toa.
-            if report_frame.url:
-                base_tag = f'<base href="{report_frame.url}">'
-                report_html, n = re.subn(
-                    r"<head[^>]*>", lambda m: m.group(0) + base_tag, report_html, count=1
-                )
-                if not n:
-                    report_html = base_tag + report_html
-
-            pdf_page = await context.new_page()
+        async with _step("abrir status_report"):
+            await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
+            if "/login" in page.url:
+                raise EaceLoginError("Sessão expirou — redirecionado para tela de login.")
             try:
-                await pdf_page.set_content(report_html, wait_until="load")
-                await _settle(pdf_page)
-                pdf_bytes = await pdf_page.pdf(format="A4", print_background=True)
-            finally:
-                await pdf_page.close()
+                await page.get_by_text(READY_TEXT).first.wait_for(state="visible", timeout=20_000)
+                await _esperar_dados(page)
+            except EacePopupError:
+                raise
+            except Exception:
+                raise EacePopupError("Status Report não apareceu em /status_report.")
+
+        async with _step("gerar PDF"):
+            await _settle(page)
+            await _esconder_botao_imprimir(page)
+            box = await page.evaluate(
+                """() => ({
+                  h: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
+                  w: Math.max(document.documentElement.scrollWidth, 1280),
+                })"""
+            )
+            pdf_bytes = await page.pdf(
+                print_background=True,
+                width=f"{box['w']}px",
+                height=f"{box['h']}px",
+                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+            )
 
         logger.info("PDF gerado com sucesso (%d bytes).", len(pdf_bytes))
         return pdf_bytes
@@ -281,3 +194,13 @@ async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
         logger.exception("Erro inesperado ao gerar o report")
         await save_error_screenshot(page, "gerar_pdf")
         raise
+
+
+async def run_report(context: BrowserContext, email: str, password: str) -> bytes:
+    """Login + PDF. Usado pelo CLI. A API loga uma vez e chama fetch_report_pdf."""
+    page = await context.new_page()
+    try:
+        await login(page, email, password)
+        return await fetch_report_pdf(context, page)
+    finally:
+        await page.close()

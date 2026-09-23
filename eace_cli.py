@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Robô EACE: login → np_report_new → Status Report → gera PDF → salva localmente.
+Robô EACE: login → /status_report → gera PDF → salva localmente.
 """
 import asyncio
 import argparse
