@@ -2,7 +2,6 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime
 
 from playwright.async_api import BrowserContext, Page
@@ -35,16 +34,6 @@ READY_TEXT = "Dashboard de Escolas Conectadas"
 SETTLE_TIMEOUT_MS = 5_000
 
 
-@asynccontextmanager
-async def _step(name: str):
-    """Loga quanto cada etapa levou. É assim que a gente descobre onde o tempo vai."""
-    started = time.monotonic()
-    try:
-        yield
-    finally:
-        logger.info("[timing] %s: %.1fs", name, time.monotonic() - started)
-
-
 async def _settle(page: Page) -> None:
     """Espera imagens e fontes, com teto. Substitui o antigo networkidle+sleep fixo."""
     try:
@@ -53,7 +42,7 @@ async def _settle(page: Page) -> None:
             timeout=SETTLE_TIMEOUT_MS,
         )
     except Exception:
-        logger.warning("Imagens não terminaram em %dms — imprimindo assim mesmo.", SETTLE_TIMEOUT_MS)
+        logger.warning("PDF: imagens não carregaram em %ds, gerando assim mesmo", SETTLE_TIMEOUT_MS // 1000)
     try:
         await page.evaluate("() => document.fonts ? document.fonts.ready : null")
     except Exception:
@@ -66,9 +55,9 @@ async def save_error_screenshot(page: Page, step: str) -> None:
     path = os.path.join(OUTPUT_DIR, f"erro_{step}_{ts}.png")
     try:
         await page.screenshot(path=path, full_page=True)
-        logger.error("Screenshot do erro salvo em %s", path)
+        logger.error("Print da tela do erro: %s", path)
     except Exception:
-        logger.exception("Não foi possível salvar screenshot do erro")
+        logger.warning("Não deu para salvar o print da tela do erro")
 
 
 class EaceLoginError(Exception):
@@ -80,23 +69,28 @@ class EacePopupError(Exception):
 
 
 async def login(page: Page, email: str, password: str) -> None:
+    started = time.monotonic()
     try:
-        logger.info("Abrindo página de login...")
+        logger.info("Login: abrindo página")
         await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         email_input = page.locator("input[type='email']")
         await email_input.wait_for(state="visible", timeout=10_000)
         await email_input.fill(email)
         await page.locator("input[type='password']").fill(password)
-        logger.info("Enviando credenciais...")
+        logger.info("Login: enviando e-mail e senha")
         await page.locator("button:has-text('Log In')").click()
 
         try:
             await page.wait_for_url("**/intranet**", timeout=20_000)
         except Exception:
             raise EaceLoginError("Login falhou — não redirecionou para /intranet. Verifique credenciais.")
-        logger.info("Login OK.")
+        logger.info("Login: OK (%.1fs)", time.monotonic() - started)
+    except EaceLoginError as e:
+        logger.error("Login: %s", e)
+        await save_error_screenshot(page, "login")
+        raise
     except Exception:
-        logger.exception("Erro na etapa 'login'")
+        logger.exception("Login: erro inesperado")
         await save_error_screenshot(page, "login")
         raise
 
@@ -132,11 +126,12 @@ def _dados_na_tela(text: str) -> bool:
 
 async def _esperar_dados(page: Page) -> None:
     """Abre, espera 5s e só segue se os números já estiverem na tela."""
-    logger.info("Aguardando 5s para os dados aparecerem na tela...")
+    logger.info("Report: página aberta, esperando 5s pelos dados")
     await page.wait_for_timeout(5_000)
     texto = await page.inner_text("body")
     if READY_TEXT not in texto or not _dados_na_tela(texto):
-        raise EacePopupError("Dados do Status Report não apareceram em 5s.")
+        raise EacePopupError("dados do Status Report não apareceram em 5s")
+    logger.info("Report: dados na tela")
 
 
 async def _esconder_botao_imprimir(page: Page) -> None:
@@ -158,34 +153,35 @@ async def fetch_report_pdf(context: BrowserContext, page: Page) -> bytes:
     A página do Bubble já é o dashboard. Não tem menu lateral nem iframe.
     """
     try:
-        async with _step("abrir status_report"):
-            await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
-            if "/login" in page.url:
-                raise EaceLoginError("Sessão expirou — redirecionado para tela de login.")
-            await _esperar_dados(page)
+        logger.info("Report: abrindo /status_report")
+        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
+        if "/login" in page.url:
+            raise EaceLoginError("sessão expirou, caiu na tela de login")
+        await _esperar_dados(page)
 
-        async with _step("gerar PDF"):
-            await _settle(page)
-            await _esconder_botao_imprimir(page)
-            box = await page.evaluate(
-                """() => ({
-                  h: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
-                  w: Math.max(document.documentElement.scrollWidth, 1280),
-                })"""
-            )
-            pdf_bytes = await page.pdf(
-                print_background=True,
-                width=f"{box['w']}px",
-                height=f"{box['h']}px",
-                margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
-            )
+        started = time.monotonic()
+        logger.info("PDF: gerando")
+        await _settle(page)
+        await _esconder_botao_imprimir(page)
+        box = await page.evaluate(
+            """() => ({
+              h: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
+              w: Math.max(document.documentElement.scrollWidth, 1280),
+            })"""
+        )
+        pdf_bytes = await page.pdf(
+            print_background=True,
+            width=f"{box['w']}px",
+            height=f"{box['h']}px",
+            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+        )
 
-        logger.info("PDF gerado com sucesso (%d bytes).", len(pdf_bytes))
+        logger.info("PDF: pronto (%d KB, %.1fs)", len(pdf_bytes) // 1024, time.monotonic() - started)
         return pdf_bytes
     except (EaceLoginError, EacePopupError):
         raise
     except Exception:
-        logger.exception("Erro inesperado ao gerar o report")
+        logger.exception("Report: erro inesperado")
         await save_error_screenshot(page, "gerar_pdf")
         raise
 

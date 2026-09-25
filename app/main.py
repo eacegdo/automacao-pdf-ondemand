@@ -7,12 +7,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from playwright.async_api import async_playwright
 
+from app.core.logs import setup_logging
 from app.eace import scraper
 from app.eace.router import _lock as report_lock
 from app.eace.router import router as eace_router
 from app.weather.router import router as weather_router
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
+setup_logging()
 
 logger = logging.getLogger("app")
 
@@ -32,26 +33,26 @@ async def _session_watchdog(app: FastAPI) -> None:
         async with report_lock:
             try:
                 if await scraper.verify_session(app.state.context):
-                    logger.info("Checagem periódica: sessão ainda válida.")
+                    logger.info("Sessão: checagem de hora em hora OK")
                     app.state.logged_in = True
                     continue
 
-                logger.info("Checagem periódica: sessão caiu. Relogando...")
+                logger.warning("Sessão: caiu, fazendo login de novo")
                 page = await app.state.context.new_page()
                 try:
                     await scraper.login(page, email, password)
                     app.state.logged_in = True
-                    logger.info("Sessão renovada pela checagem periódica.")
+                    logger.info("Sessão: renovada")
                 finally:
                     await page.close()
             except Exception:
-                logger.exception("Checagem periódica de sessão falhou.")
+                logger.exception("Sessão: checagem falhou")
                 app.state.logged_in = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Iniciando Chromium persistente...")
+    logger.info("Startup: abrindo Chromium")
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
@@ -72,7 +73,7 @@ async def lifespan(app: FastAPI):
     app.state.browser = browser
     app.state.context = context
     app.state.logged_in = False
-    logger.info("Chromium pronto.")
+    logger.info("Startup: Chromium pronto")
 
     email = os.environ.get("EACE_EMAIL")
     password = os.environ.get("EACE_PASSWORD")
@@ -82,9 +83,9 @@ async def lifespan(app: FastAPI):
             await scraper.login(page, email, password)
             await page.close()
             app.state.logged_in = True
-            logger.info("Sessão já iniciada no startup — logins subsequentes serão pulados.")
+            logger.info("Startup: pronto, sessão logada")
         except Exception:
-            logger.exception("Login no startup falhou — será tentado de novo na primeira requisição.")
+            logger.error("Startup: login falhou, tenta de novo na primeira chamada")
 
     watchdog_task = asyncio.create_task(_session_watchdog(app))
 

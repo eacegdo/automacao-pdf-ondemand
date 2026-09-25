@@ -33,6 +33,7 @@ def _check_api_key(x_api_key: str | None):
 
 async def _ensure_logged_in(request: Request, email: str, password: str) -> None:
     if request.app.state.logged_in:
+        logger.info("Login: sessão já ativa, pulando")
         return
 
     context = request.app.state.context
@@ -48,9 +49,9 @@ async def _ensure_logged_in(request: Request, email: str, password: str) -> None
             last_error = e
             await page.close()
             logger.warning(
-                "Tentativa de login %d/%d falhou (%s). %s",
-                attempt, MAX_LOGIN_ATTEMPTS, e,
-                "Tentando novamente..." if attempt < MAX_LOGIN_ATTEMPTS else "Desistindo.",
+                "Login: tentativa %d/%d falhou. %s",
+                attempt, MAX_LOGIN_ATTEMPTS,
+                f"Nova tentativa em {LOGIN_RETRY_BACKOFF_SECONDS}s" if attempt < MAX_LOGIN_ATTEMPTS else "Desistindo",
             )
             if attempt < MAX_LOGIN_ATTEMPTS:
                 await asyncio.sleep(LOGIN_RETRY_BACKOFF_SECONDS)
@@ -70,9 +71,11 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
         raise HTTPException(status_code=500, detail="EACE_EMAIL ou EACE_PASSWORD não configurados")
 
     if _lock.locked():
+        logger.warning("Chamada recusada: robô já está rodando")
         raise HTTPException(status_code=429, detail="Robô já em execução. Tente em instantes.")
 
     start_time = time.monotonic()
+    logger.info("▶ Robô chamado")
 
     async with _lock:
         context = request.app.state.context
@@ -93,16 +96,16 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
                 last_error = e
                 if session_relogged:
                     raise HTTPException(status_code=502, detail=str(e))
-                logger.warning("Sessão expirou em pleno uso (%s). Relogando...", e)
+                logger.warning("Report: sessão expirou, fazendo login de novo")
                 request.app.state.logged_in = False
                 session_relogged = True
                 await _ensure_logged_in(request, email, password)
             except EacePopupError as e:
                 last_error = e
                 logger.warning(
-                    "Tentativa %d/%d de buscar o report falhou (%s). %s",
+                    "Report: tentativa %d/%d falhou (%s). %s",
                     attempt, MAX_REPORT_ATTEMPTS, e,
-                    "Tentando novamente..." if attempt < MAX_REPORT_ATTEMPTS else "Desistindo.",
+                    f"Nova tentativa em {REPORT_RETRY_BACKOFF_SECONDS}s" if attempt < MAX_REPORT_ATTEMPTS else "Desistindo",
                 )
                 if attempt < MAX_REPORT_ATTEMPTS:
                     await page.close()
@@ -110,15 +113,15 @@ async def run_report_endpoint(request: Request, x_api_key: str | None = Header(d
                 else:
                     await page.close()
             except Exception as e:
-                logger.exception("Falha na automação do Status Report")
                 await page.close()
                 raise HTTPException(status_code=502, detail=str(e))
 
         if pdf_bytes is None:
+            logger.error("■ Falhou em %.1fs: %s", time.monotonic() - start_time, last_error)
             raise HTTPException(status_code=502, detail=str(last_error))
 
     elapsed = time.monotonic() - start_time
-    logger.info("Relatório gerado em %.1fs.", elapsed)
+    logger.info("■ Concluído em %.1fs, PDF enviado", elapsed)
 
     filename = f"status_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     return Response(
