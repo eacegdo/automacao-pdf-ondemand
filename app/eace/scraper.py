@@ -125,12 +125,12 @@ def _dados_na_tela(text: str) -> bool:
 
 
 async def _esperar_dados(page: Page) -> None:
-    """Abre, espera 5s e só segue se os números já estiverem na tela."""
-    logger.info("Report: página aberta, esperando 5s pelos dados")
-    await page.wait_for_timeout(5_000)
+    """Abre, espera 10s e só segue se os números já estiverem na tela."""
+    logger.info("Report: página aberta, esperando 10s pelos dados")
+    await page.wait_for_timeout(10_000)
     texto = await page.inner_text("body")
     if READY_TEXT not in texto or not _dados_na_tela(texto):
-        raise EacePopupError("dados do Status Report não apareceram em 5s")
+        raise EacePopupError("dados do Status Report não apareceram em 10s")
     logger.info("Report: dados na tela")
 
 
